@@ -240,9 +240,13 @@ impl Default for MockPlatformFixture {
 fn test_suite1_renumbered_zones_and_hwmon() {
     let fixture = MockPlatformFixture::new();
 
-    // Hwmon nodes at arbitrary non-standard indices: hwmon99 and hwmon13
+    // Hwmon nodes at arbitrary non-standard indices: hwmon99 and hwmon13 (5-channel emc2305)
     fixture.add_hwmon_power("hwmon99", "ina232", 15_400_000, 12_000, 1_280);
     fixture.add_hwmon_fan("hwmon13", "emc2305", "fan1", 3_250);
+    fixture.add_hwmon_fan("hwmon13", "emc2305", "fan2", 0);
+    fixture.add_hwmon_fan("hwmon13", "emc2305", "fan3", 0);
+    fixture.add_hwmon_fan("hwmon13", "emc2305", "fan4", 0);
+    fixture.add_hwmon_fan("hwmon13", "emc2305", "fan5", 0);
 
     // Thermal zones at arbitrary renumbered indices
     fixture.add_thermal_zone("thermal_zone42", "nsp-core", 46_000);

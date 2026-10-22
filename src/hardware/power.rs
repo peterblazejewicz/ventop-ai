@@ -20,6 +20,10 @@ pub struct HardwarePowerFan {
 
 static IDLE_BASELINE_BITS: AtomicU64 = AtomicU64::new(0x402699999999999au64); // 11.3_f64.to_bits()
 
+/// Maximum physically sane fan RPM ceiling.
+/// Guards against 0xFFFF (65535) tach register saturation or EMI spikes on floating tachometer pins.
+const MAX_SANE_FAN_RPM: u32 = 30_000;
+
 /// Override the default board idle baseline power in Watts
 pub fn set_idle_baseline_watts(val: f64) {
     IDLE_BASELINE_BITS.store(val.to_bits(), Ordering::Relaxed);
@@ -59,15 +63,31 @@ pub fn get_hardware_power_fan() -> HardwarePowerFan {
                 0
             };
 
-            // Scan for fan*_input in this hwmon dir
-            let mut found_rpm = None;
+            // Scan all fan*_input channels in this hwmon dir (do not break on first channel,
+            // as multi-channel controllers like emc2305 expose fan1_input..fan5_input and
+            // fs::read_dir order in sysfs is non-alphabetical).
+            let mut found_rpm: Option<u32> = None;
             if let Ok(dir_entries) = fs::read_dir(&path) {
                 for f_entry in dir_entries.flatten() {
                     let f_name = f_entry.file_name().to_string_lossy().to_string();
-                    if f_name.starts_with("fan") && f_name.ends_with("_input") {
-                        if let Some(rpm) = read_cached_u32(&f_entry.path().to_string_lossy()) {
-                            found_rpm = Some(rpm);
-                            break;
+                    if let Some(prefix) = f_name.strip_suffix("_input") {
+                        if prefix.starts_with("fan") {
+                            if let Some(rpm) = read_cached_u32(&f_entry.path().to_string_lossy()) {
+                                if rpm > MAX_SANE_FAN_RPM {
+                                    continue;
+                                }
+                                if rpm > 0 {
+                                    let fault_path = path.join(format!("{}_fault", prefix));
+                                    if let Some(fault) =
+                                        read_cached_u32(&fault_path.to_string_lossy())
+                                    {
+                                        if fault != 0 {
+                                            continue;
+                                        }
+                                    }
+                                }
+                                found_rpm = Some(found_rpm.map_or(rpm, |prev| prev.max(rpm)));
+                            }
                         }
                     }
                 }
@@ -200,9 +220,13 @@ mod tests {
         std::fs::write(hwmon17.join("in1_input"), "12050\n").unwrap();
         std::fs::write(hwmon17.join("curr1_input"), "1030\n").unwrap();
 
-        // hwmon8 is emc2305 with non-fan1 channel: fan3_input
+        // hwmon8 is emc2305 with all 5 channels (fan1_input..fan5_input, only fan3_input active)
         std::fs::write(hwmon8.join("name"), "emc2305\n").unwrap();
+        std::fs::write(hwmon8.join("fan1_input"), "0\n").unwrap();
+        std::fs::write(hwmon8.join("fan2_input"), "0\n").unwrap();
         std::fs::write(hwmon8.join("fan3_input"), "2850\n").unwrap();
+        std::fs::write(hwmon8.join("fan4_input"), "0\n").unwrap();
+        std::fs::write(hwmon8.join("fan5_input"), "0\n").unwrap();
 
         let _guard = EnvGuard::set_root(&temp_dir);
         let pf = get_hardware_power_fan();
@@ -211,6 +235,71 @@ mod tests {
         assert_eq!(pf.board_current_a, Some(1.03));
         assert_eq!(pf.power_device.as_deref(), Some("ina232"));
         assert_eq!(pf.fan_rpm, Some(2850));
+        assert_eq!(pf.fan_device.as_deref(), Some("emc2305"));
+
+        drop(_guard);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_ventuno_emc2305_five_channel_all_positions_active() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("ventop_hw_emc5ch_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let hwmon0 = temp_dir.join("sys/class/hwmon/hwmon0");
+        std::fs::create_dir_all(&hwmon0).unwrap();
+        std::fs::write(hwmon0.join("name"), "emc2305\n").unwrap();
+
+        let _guard = EnvGuard::set_root(&temp_dir);
+
+        for active_ch in 1..=5 {
+            for ch in 1..=5 {
+                let rpm = if ch == active_ch { 2818 } else { 0 };
+                std::fs::write(hwmon0.join(format!("fan{}_input", ch)), format!("{}\n", rpm))
+                    .unwrap();
+                std::fs::write(hwmon0.join(format!("fan{}_fault", ch)), "0\n").unwrap();
+            }
+            crate::file_cache::reset_file_cache();
+
+            let pf = get_hardware_power_fan();
+            assert_eq!(
+                pf.fan_rpm,
+                Some(2818),
+                "Failed to read 2818 RPM when active channel was fan{}",
+                active_ch
+            );
+            assert_eq!(pf.fan_device.as_deref(), Some("emc2305"));
+        }
+
+        drop(_guard);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_emc2305_ignores_faulted_and_saturated_fan_channels() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("ventop_hw_emcfault_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let hwmon0 = temp_dir.join("sys/class/hwmon/hwmon0");
+        std::fs::create_dir_all(&hwmon0).unwrap();
+        std::fs::write(hwmon0.join("name"), "emc2305\n").unwrap();
+
+        // fan1: valid 2818 RPM, no fault
+        std::fs::write(hwmon0.join("fan1_input"), "2818\n").unwrap();
+        std::fs::write(hwmon0.join("fan1_fault"), "0\n").unwrap();
+        // fan2: bogus 9500 RPM, faulted (fan2_fault = 1)
+        std::fs::write(hwmon0.join("fan2_input"), "9500\n").unwrap();
+        std::fs::write(hwmon0.join("fan2_fault"), "1\n").unwrap();
+        // fan3: saturated 65535 RPM (> MAX_SANE_FAN_RPM), even with fan3_fault = 0
+        std::fs::write(hwmon0.join("fan3_input"), "65535\n").unwrap();
+        std::fs::write(hwmon0.join("fan3_fault"), "0\n").unwrap();
+        // fan4..fan5: unused 0 RPM
+        std::fs::write(hwmon0.join("fan4_input"), "0\n").unwrap();
+        std::fs::write(hwmon0.join("fan5_input"), "0\n").unwrap();
+
+        let _guard = EnvGuard::set_root(&temp_dir);
+        let pf = get_hardware_power_fan();
+        assert_eq!(pf.fan_rpm, Some(2818));
         assert_eq!(pf.fan_device.as_deref(), Some("emc2305"));
 
         drop(_guard);
