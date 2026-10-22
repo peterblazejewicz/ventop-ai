@@ -13,7 +13,7 @@ use crate::hardware::{
     get_cpu_clusters_with_load, get_cpu_frequencies, get_hardware_power_fan,
     get_platform_run_facts, get_soc_model,
 };
-use crate::hexagon::collect_hexagon_snapshot;
+use crate::hexagon::collect_hexagon_snapshot_with_power;
 use crate::sysinfo_ext::{
     get_cpu_stats, get_tracked_processes_with_predicate_opts, get_zram_info, is_ventuno_big_core,
     CpuStats,
@@ -202,10 +202,10 @@ fn build_snapshot_internal(
     };
 
     let gpu = get_adreno_gpu_metrics();
-    let hexagon_npu = collect_hexagon_snapshot();
+    let power_fan = get_hardware_power_fan();
+    let hexagon_npu = collect_hexagon_snapshot_with_power(power_fan.board_power_watts);
     let action_brain = collect_action_brain_snapshot();
     let thermals = get_consolidated_thermals();
-    let power_fan = get_hardware_power_fan();
 
     let load_avg = System::load_average();
     let stats = StatsSnapshot {

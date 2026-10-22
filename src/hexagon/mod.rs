@@ -122,6 +122,12 @@ pub fn get_cdsp_remoteproc_state() -> (bool, String) {
 
 /// Collect full telemetry snapshot of the Hexagon NPU
 pub fn collect_hexagon_snapshot() -> HexagonNpuSnapshot {
+    collect_hexagon_snapshot_with_power(get_current_board_power_w())
+}
+
+/// Collect full telemetry snapshot of the Hexagon NPU using a pre-fetched board power reading
+/// to avoid duplicate `/sys/class/hwmon` scans on the same telemetry tick.
+pub fn collect_hexagon_snapshot_with_power(current_power_w: Option<f64>) -> HexagonNpuSnapshot {
     let (is_running, remoteproc_state) = get_cdsp_remoteproc_state();
     let dev_cdsp = resolve_sysfs_path("/dev/fastrpc-cdsp");
     let dev_cdsp_sec = resolve_sysfs_path("/dev/fastrpc-cdsp-secure");
@@ -159,7 +165,6 @@ pub fn collect_hexagon_snapshot() -> HexagonNpuSnapshot {
     let silicon_thermals = get_nsp_silicon_thermals();
     let peak_temp = silicon_thermals.peak_celsius.unwrap_or(0);
 
-    let current_power_w = get_current_board_power_w();
     let idle_baseline_w = crate::hardware::get_idle_baseline_watts();
     let raw_power_delta = current_power_w
         .map(|w| (w - idle_baseline_w).max(0.0))

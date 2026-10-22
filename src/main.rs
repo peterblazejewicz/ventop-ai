@@ -325,10 +325,10 @@ fn run_tui() -> Result<()> {
     let mut clusters = get_cpu_clusters_with_load(&per_core_pct);
     let mut cpu_freqs = get_cpu_frequencies();
     let mut gpu = get_adreno_gpu_metrics();
-    let mut hexagon = collect_hexagon_snapshot();
+    let mut power_fan = get_hardware_power_fan();
+    let mut hexagon = collect_hexagon_snapshot_with_power(power_fan.board_power_watts);
     let mut action_brain = collect_action_brain_snapshot();
     let mut thermals = get_consolidated_thermals();
-    let mut power_fan = get_hardware_power_fan();
     let mut top_processes = get_top_processes(&sys, 100, ui_state.process_sort);
 
     loop {
@@ -453,10 +453,10 @@ fn run_tui() -> Result<()> {
             clusters = get_cpu_clusters_with_load(&per_core_pct);
             cpu_freqs = get_cpu_frequencies();
             gpu = get_adreno_gpu_metrics();
-            hexagon = collect_hexagon_snapshot();
+            power_fan = get_hardware_power_fan();
+            hexagon = collect_hexagon_snapshot_with_power(power_fan.board_power_watts);
             action_brain = collect_action_brain_snapshot();
             thermals = get_consolidated_thermals();
-            power_fan = get_hardware_power_fan();
             top_processes = get_top_processes(&sys, 100, ui_state.process_sort);
 
             last_tick = Instant::now();

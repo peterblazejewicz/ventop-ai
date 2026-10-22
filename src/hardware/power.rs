@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Piotr Błażejewicz and contributors
 
-use crate::file_cache::{read_cached_u32, resolve_sysfs_path};
+use crate::file_cache::{read_cached_file, read_cached_u32, resolve_sysfs_path};
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Hardware power and fan metrics from INA232 and EMC2305 hwmon sensors
@@ -43,6 +44,81 @@ fn parse_hwmon_channel(prefix: &str, kind: &str) -> Option<u32> {
     digits.parse::<u32>().ok()
 }
 
+#[derive(Default)]
+struct HwmonDeviceReadings {
+    fan_rpm: Option<u32>,
+    power_uw: Option<u32>,
+    volt_mv: Option<u32>,
+    curr_ma: Option<u32>,
+}
+
+/// Scan a single `hwmon*` device directory in one pass for fan and/or power channels.
+fn scan_hwmon_device_dir(
+    path: &Path,
+    scan_fan: bool,
+    scan_power: bool,
+) -> HwmonDeviceReadings {
+    let mut readings = HwmonDeviceReadings::default();
+    if !scan_fan && !scan_power {
+        return readings;
+    }
+
+    let mut found_bus_volt_mv: Option<u32> = None;
+    let mut found_shunt_volt_mv: Option<u32> = None;
+
+    if let Ok(dir_entries) = fs::read_dir(path) {
+        for entry in dir_entries.flatten() {
+            let f_name = entry.file_name().to_string_lossy().to_string();
+            let Some(prefix) = f_name.strip_suffix("_input") else {
+                continue;
+            };
+
+            if scan_fan && matches!(parse_hwmon_channel(prefix, "fan"), Some(ch) if ch >= 1) {
+                if let Some(rpm) = read_cached_u32(&entry.path().to_string_lossy()) {
+                    if rpm > MAX_SANE_FAN_RPM {
+                        continue;
+                    }
+                    if rpm > 0 {
+                        let fault_path = path.join(format!("{}_fault", prefix));
+                        if let Some(fault) = read_cached_u32(&fault_path.to_string_lossy()) {
+                            if fault != 0 {
+                                continue;
+                            }
+                        }
+                    }
+                    readings.fan_rpm = Some(readings.fan_rpm.map_or(rpm, |prev| prev.max(rpm)));
+                }
+            } else if scan_power {
+                if matches!(parse_hwmon_channel(prefix, "power"), Some(ch) if ch >= 1) {
+                    if let Some(uw) = read_cached_u32(&entry.path().to_string_lossy()) {
+                        readings.power_uw =
+                            Some(readings.power_uw.map_or(uw, |prev| prev.max(uw)));
+                    }
+                } else if let Some(ch) = parse_hwmon_channel(prefix, "in") {
+                    if let Some(mv) = read_cached_u32(&entry.path().to_string_lossy()) {
+                        if ch == 0 {
+                            // in0_input on INA2xx/INA232 is shunt voltage across the sense resistor;
+                            // only use as a fallback when no bus voltage channel (in[1..]_input) exists.
+                            found_shunt_volt_mv =
+                                Some(found_shunt_volt_mv.map_or(mv, |prev| prev.max(mv)));
+                        } else {
+                            found_bus_volt_mv =
+                                Some(found_bus_volt_mv.map_or(mv, |prev| prev.max(mv)));
+                        }
+                    }
+                } else if matches!(parse_hwmon_channel(prefix, "curr"), Some(ch) if ch >= 1) {
+                    if let Some(ma) = read_cached_u32(&entry.path().to_string_lossy()) {
+                        readings.curr_ma = Some(readings.curr_ma.map_or(ma, |prev| prev.max(ma)));
+                    }
+                }
+            }
+        }
+    }
+
+    readings.volt_mv = found_bus_volt_mv.or(found_shunt_volt_mv);
+    readings
+}
+
 /// Read hardware fan speed and live board power draw from /sys/class/hwmon
 pub fn get_hardware_power_fan() -> HardwarePowerFan {
     let mut result = HardwarePowerFan::default();
@@ -53,72 +129,31 @@ pub fn get_hardware_power_fan() -> HardwarePowerFan {
     let mut best_fan_priority = 0u8;
 
     if let Ok(entries) = fs::read_dir(hwmon_dir) {
-        for entry in entries.flatten() {
+        let mut sorted_entries: Vec<_> = entries.flatten().collect();
+        sorted_entries.sort_by_key(|e| e.file_name());
+
+        let mut fallback_fan_dirs: Vec<(PathBuf, String)> = Vec::new();
+
+        for entry in sorted_entries {
             let path = entry.path();
             let name_path = path.join("name");
-            let dev_name = fs::read_to_string(&name_path)
+            let dev_name = read_cached_file(&name_path.to_string_lossy())
                 .unwrap_or_default()
                 .trim()
                 .to_string();
             let dev_name_lower = dev_name.to_lowercase();
 
-            // Fan controller matching:
+            // Explicit fan controller matching:
             // emc2305 / emc -> priority 3
             // fan -> priority 2
-            // any other device exposing fan[1..]_input -> priority 1
+            // any other device exposing fan[1..]_input -> priority 1 (fallback)
             let fan_priority = if dev_name_lower.contains("emc") {
                 3
             } else if dev_name_lower.contains("fan") {
                 2
             } else {
-                1
+                0
             };
-
-            // Scan all fan*_input channels in this hwmon dir (do not break on first channel,
-            // as multi-channel controllers like emc2305 expose fan1_input..fan5_input and
-            // fs::read_dir order in sysfs is non-alphabetical).
-            let mut found_rpm: Option<u32> = None;
-            if let Ok(dir_entries) = fs::read_dir(&path) {
-                for f_entry in dir_entries.flatten() {
-                    let f_name = f_entry.file_name().to_string_lossy().to_string();
-                    if let Some(prefix) = f_name.strip_suffix("_input") {
-                        if matches!(parse_hwmon_channel(prefix, "fan"), Some(ch) if ch >= 1) {
-                            if let Some(rpm) = read_cached_u32(&f_entry.path().to_string_lossy()) {
-                                if rpm > MAX_SANE_FAN_RPM {
-                                    continue;
-                                }
-                                if rpm > 0 {
-                                    let fault_path = path.join(format!("{}_fault", prefix));
-                                    if let Some(fault) =
-                                        read_cached_u32(&fault_path.to_string_lossy())
-                                    {
-                                        if fault != 0 {
-                                            continue;
-                                        }
-                                    }
-                                }
-                                found_rpm = Some(found_rpm.map_or(rpm, |prev| prev.max(rpm)));
-                            }
-                        }
-                    }
-                }
-            }
-
-            if let Some(rpm) = found_rpm {
-                let effective_prio = fan_priority;
-                let should_replace_fan = effective_prio > best_fan_priority
-                    || (effective_prio == best_fan_priority
-                        && result.fan_rpm.map_or(true, |current_rpm| rpm > current_rpm));
-                if should_replace_fan {
-                    best_fan_priority = effective_prio;
-                    result.fan_rpm = Some(rpm);
-                    result.fan_device = Some(if !dev_name.is_empty() {
-                        dev_name.clone()
-                    } else {
-                        "fan".to_string()
-                    });
-                }
-            }
 
             // Power monitor matching:
             // ina232 / ina2 -> priority 2
@@ -132,56 +167,67 @@ pub fn get_hardware_power_fan() -> HardwarePowerFan {
                     0
                 };
 
-            if power_priority >= best_power_priority && power_priority > 0 {
-                let mut found_power_uw: Option<u32> = None;
-                let mut found_bus_volt_mv: Option<u32> = None;
-                let mut found_shunt_volt_mv: Option<u32> = None;
-                let mut found_curr_ma: Option<u32> = None;
+            if fan_priority == 0 && power_priority == 0 {
+                // Defer non-fan/non-power hwmon directories (e.g. 44 thermal zones on Ventuno Q)
+                // so we never call fs::read_dir on them when a dedicated fan controller is present.
+                fallback_fan_dirs.push((path, dev_name));
+                continue;
+            }
 
-                if let Ok(dir_entries) = fs::read_dir(&path) {
-                    for p_entry in dir_entries.flatten() {
-                        let p_name = p_entry.file_name().to_string_lossy().to_string();
-                        let Some(prefix) = p_name.strip_suffix("_input") else {
-                            continue;
-                        };
-                        if matches!(parse_hwmon_channel(prefix, "power"), Some(ch) if ch >= 1) {
-                            if let Some(uw) = read_cached_u32(&p_entry.path().to_string_lossy()) {
-                                found_power_uw = Some(found_power_uw.map_or(uw, |prev| prev.max(uw)));
-                            }
-                        } else if let Some(ch) = parse_hwmon_channel(prefix, "in") {
-                            if let Some(mv) = read_cached_u32(&p_entry.path().to_string_lossy()) {
-                                if ch == 0 {
-                                    // in0_input on INA2xx/INA232 is shunt voltage across the sense resistor;
-                                    // only use as a fallback when no bus voltage channel (in[1..]_input) exists.
-                                    found_shunt_volt_mv =
-                                        Some(found_shunt_volt_mv.map_or(mv, |prev| prev.max(mv)));
-                                } else {
-                                    found_bus_volt_mv =
-                                        Some(found_bus_volt_mv.map_or(mv, |prev| prev.max(mv)));
-                                }
-                            }
-                        } else if matches!(parse_hwmon_channel(prefix, "curr"), Some(ch) if ch >= 1)
-                        {
-                            if let Some(ma) = read_cached_u32(&p_entry.path().to_string_lossy()) {
-                                found_curr_ma = Some(found_curr_ma.map_or(ma, |prev| prev.max(ma)));
-                            }
-                        }
-                    }
+            let effective_fan_prio = if fan_priority > 0 { fan_priority } else { 1 };
+            let scan_fan = effective_fan_prio >= best_fan_priority;
+            let scan_power = power_priority >= best_power_priority && power_priority > 0;
+
+            let readings = scan_hwmon_device_dir(&path, scan_fan, scan_power);
+
+            if let Some(rpm) = readings.fan_rpm {
+                let should_replace_fan = effective_fan_prio > best_fan_priority
+                    || (effective_fan_prio == best_fan_priority
+                        && result.fan_rpm.map_or(true, |current_rpm| rpm > current_rpm));
+                if should_replace_fan {
+                    best_fan_priority = effective_fan_prio;
+                    result.fan_rpm = Some(rpm);
+                    result.fan_device = Some(if !dev_name.is_empty() {
+                        dev_name.clone()
+                    } else {
+                        "fan".to_string()
+                    });
                 }
+            }
 
-                let found_volt_mv = found_bus_volt_mv.or(found_shunt_volt_mv);
+            if let Some(uw) = readings.power_uw {
+                let should_replace_power = power_priority > best_power_priority
+                    || (power_priority == best_power_priority
+                        && (result.board_power_watts.is_none() || uw > best_power_uw));
+                if should_replace_power {
+                    best_power_priority = power_priority;
+                    best_power_uw = uw;
+                    result.board_power_watts = Some(uw as f64 / 1_000_000.0);
+                    result.power_device = Some(dev_name);
+                    result.board_voltage_v = readings.volt_mv.map(|mv| mv as f64 / 1_000.0);
+                    result.board_current_a = readings.curr_ma.map(|ma| ma as f64 / 1_000.0);
+                }
+            }
+        }
 
-                if let Some(uw) = found_power_uw {
-                    let should_replace_power = power_priority > best_power_priority
-                        || (power_priority == best_power_priority
-                            && (result.board_power_watts.is_none() || uw > best_power_uw));
-                    if should_replace_power {
-                        best_power_priority = power_priority;
-                        best_power_uw = uw;
-                        result.board_power_watts = Some(uw as f64 / 1_000_000.0);
-                        result.power_device = Some(dev_name.clone());
-                        result.board_voltage_v = found_volt_mv.map(|mv| mv as f64 / 1_000.0);
-                        result.board_current_a = found_curr_ma.map(|ma| ma as f64 / 1_000.0);
+        // Only scan deferred generic hwmon directories if no dedicated fan controller (priority >= 2)
+        // was found during the primary pass.
+        if best_fan_priority <= 1 {
+            for (path, dev_name) in fallback_fan_dirs {
+                let readings = scan_hwmon_device_dir(&path, true, false);
+                if let Some(rpm) = readings.fan_rpm {
+                    let effective_prio = 1;
+                    let should_replace_fan = effective_prio > best_fan_priority
+                        || (effective_prio == best_fan_priority
+                            && result.fan_rpm.map_or(true, |current_rpm| rpm > current_rpm));
+                    if should_replace_fan {
+                        best_fan_priority = effective_prio;
+                        result.fan_rpm = Some(rpm);
+                        result.fan_device = Some(if !dev_name.is_empty() {
+                            dev_name
+                        } else {
+                            "fan".to_string()
+                        });
                     }
                 }
             }
@@ -444,6 +490,59 @@ mod tests {
 
         // Reset to default
         set_idle_baseline_watts(11.3);
+
+        drop(_guard);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_fallback_generic_fan_and_thermal_hwmon_skip() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("ventop_hw_thermal_skip_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        // Create 44 thermal hwmon directories alongside emc2305 (hwmon0) and ina232 (hwmon4)
+        for i in 0..46 {
+            let dir = temp_dir.join(format!("sys/class/hwmon/hwmon{}", i));
+            std::fs::create_dir_all(&dir).unwrap();
+            if i == 0 {
+                std::fs::write(dir.join("name"), "emc2305\n").unwrap();
+                std::fs::write(dir.join("fan1_input"), "2818\n").unwrap();
+                std::fs::write(dir.join("fan1_fault"), "0\n").unwrap();
+            } else if i == 4 {
+                std::fs::write(dir.join("name"), "ina232\n").unwrap();
+                std::fs::write(dir.join("power1_input"), "11500000\n").unwrap();
+                std::fs::write(dir.join("in1_input"), "12000\n").unwrap();
+                std::fs::write(dir.join("curr1_input"), "958\n").unwrap();
+            } else {
+                std::fs::write(dir.join("name"), format!("tsens_tz_sensor{}\n", i)).unwrap();
+                std::fs::write(dir.join("temp1_input"), "45000\n").unwrap();
+            }
+        }
+
+        let _guard = EnvGuard::set_root(&temp_dir);
+        let pf = get_hardware_power_fan();
+        assert_eq!(pf.fan_rpm, Some(2818));
+        assert_eq!(pf.fan_device.as_deref(), Some("emc2305"));
+        assert_eq!(pf.board_power_watts, Some(11.5));
+        assert_eq!(pf.power_device.as_deref(), Some("ina232"));
+
+        // Verify fallback pass discovers generic fan device when no emc/fan device is present
+        std::fs::write(
+            temp_dir.join("sys/class/hwmon/hwmon0/name"),
+            "some_custom_asic\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp_dir.join("sys/class/hwmon/hwmon0/fan1_input"),
+            "1800\n",
+        )
+        .unwrap();
+        crate::file_cache::reset_file_cache();
+
+        let pf_fallback = get_hardware_power_fan();
+        assert_eq!(pf_fallback.fan_rpm, Some(1800));
+        assert_eq!(pf_fallback.fan_device.as_deref(), Some("some_custom_asic"));
 
         drop(_guard);
         let _ = std::fs::remove_dir_all(&temp_dir);
