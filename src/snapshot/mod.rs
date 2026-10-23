@@ -12,7 +12,8 @@ pub use stream::{
     print_oneshot_snapshot, reset_prev_cpu_stats, stream_json_snapshots, StreamOptions,
 };
 pub use summary::{
-    calc_f32_stats, calc_f64_stats, is_end_marker, print_summary, PhaseSummary, SummaryTracker,
+    calc_f32_stats, calc_f64_stats, calc_u32_stats, is_end_marker, print_summary, PhaseSummary,
+    SummaryTracker,
 };
 pub use types::{
     CpuSnapshot, HostInfo, MarkerRecord, MemorySnapshot, NpuPhase, ProcessLifecycleEvent,

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Piotr Błażejewicz and contributors
 
+use std::fmt::Write as _;
+
 use serde::Serialize;
 
 use super::types::{MarkerRecord, NpuPhase, SampleTelemetry, StatSummary, VentopSnapshot};
@@ -53,6 +55,24 @@ pub fn calc_f32_stats(mut values: Vec<f32>) -> Option<StatSummary<f32>> {
     })
 }
 
+pub fn calc_u32_stats(mut values: Vec<u32>) -> Option<StatSummary<u32>> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable();
+    let n = values.len();
+    let min = values[0];
+    let max = values[n - 1];
+    let median = values[n * 50 / 100];
+    let p90 = values[n * 90 / 100];
+    Some(StatSummary {
+        min,
+        median,
+        p90,
+        max,
+    })
+}
+
 /// Helper to identify end-of-phase markers (e.g., gen-end, req-end, done, stop)
 pub fn is_end_marker(label: &str) -> bool {
     let lower = label.to_ascii_lowercase();
@@ -71,6 +91,7 @@ pub fn is_end_marker(label: &str) -> bool {
 pub struct SummaryTracker {
     pub samples: Vec<SampleTelemetry>,
     pub(crate) power_watts: Vec<f64>,
+    pub(crate) fan_rpms: Vec<u32>,
     pub(crate) cpu_total: Vec<f32>,
     pub(crate) cpu_big: Vec<f32>,
     pub(crate) cpu_little: Vec<f32>,
@@ -131,6 +152,9 @@ impl SummaryTracker {
         if let Some(w) = s.power_fan.board_power_watts {
             self.power_watts.push(w);
         }
+        if let Some(rpm) = s.power_fan.fan_rpm {
+            self.fan_rpms.push(rpm);
+        }
         self.cpu_total.push(s.cpu.total_load_pct);
         self.cpu_big.push(s.cpu.big_cluster_load_pct);
         self.cpu_little.push(s.cpu.little_cluster_load_pct);
@@ -171,89 +195,115 @@ impl SummaryTracker {
         }
     }
 
-    pub fn print_report(&self, active_threshold_pct: f32, elapsed_secs: f64) {
+    pub fn format_report(&self, active_threshold_pct: f32, elapsed_secs: f64) -> String {
         if self.total_samples == 0 {
-            eprintln!("No telemetry samples collected for summary.");
-            return;
+            return "No telemetry samples collected for summary.\n".to_string();
         }
 
+        let mut out = String::new();
         let npu_share = (self.npu_active_samples as f64 / self.total_samples as f64) * 100.0;
         let coactive_share =
             (self.npu_active_and_tracked_busy_samples as f64 / self.total_samples as f64) * 100.0;
 
-        eprintln!();
-        eprintln!(
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
             "================================================================================"
         );
-        eprintln!("                       VENTOP-AI RUN SUMMARY REPORT");
-        eprintln!(
+        let _ = writeln!(out, "                       VENTOP-AI RUN SUMMARY REPORT");
+        let _ = writeln!(
+            out,
             "================================================================================"
         );
-        eprintln!(
+        let _ = writeln!(
+            out,
             "Duration / Samples : {} samples (~{:.1}s)",
             self.total_samples, elapsed_secs
         );
-        eprintln!(
+        let _ = writeln!(
+            out,
             "Active NPU Share   : {:.1}% ({}/{} samples)",
             npu_share, self.npu_active_samples, self.total_samples
         );
-        eprintln!(
+        let _ = writeln!(
+            out,
             "Co-Activity Share  : {:.1}% (NPU active while tracked proc >= {:.1}% CPU)",
             coactive_share, active_threshold_pct
         );
-        eprintln!();
-        eprintln!(
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
             "{:<28} {:>10} {:>10} {:>10} {:>10}",
             "METRIC", "MIN", "MEDIAN", "P90", "MAX"
         );
-        eprintln!(
+        let _ = writeln!(
+            out,
             "────────────────────────────────────────────────────────────────────────────────"
         );
 
-        let print_f64_row = |name: &str, data: &[f64], unit: &str| {
+        let print_f64_row = |out: &mut String, name: &str, data: &[f64], unit: &str| {
             if let Some(st) = calc_f64_stats(data.to_vec()) {
                 let label = if unit.is_empty() {
                     name.to_string()
                 } else {
                     format!("{} ({})", name, unit)
                 };
-                eprintln!(
+                let _ = writeln!(
+                    out,
                     "{:<28} {:>10.2} {:>10.2} {:>10.2} {:>10.2}",
                     label, st.min, st.median, st.p90, st.max
                 );
             }
         };
 
-        let print_f32_row = |name: &str, data: &[f32], unit: &str| {
+        let print_f32_row = |out: &mut String, name: &str, data: &[f32], unit: &str| {
             if let Some(st) = calc_f32_stats(data.to_vec()) {
                 let label = if unit.is_empty() {
                     name.to_string()
                 } else {
                     format!("{} ({})", name, unit)
                 };
-                eprintln!(
+                let _ = writeln!(
+                    out,
                     "{:<28} {:>10.1} {:>10.1} {:>10.1} {:>10.1}",
                     label, st.min, st.median, st.p90, st.max
                 );
             }
         };
 
-        print_f64_row("Board Power", &self.power_watts, "W");
-        print_f32_row("CPU Total Load", &self.cpu_total, "%");
-        print_f32_row("  Big Cluster (A78C)", &self.cpu_big, "%");
-        print_f32_row("  Little Cluster (A55)", &self.cpu_little, "%");
-        print_f64_row("RAM Available", &self.ram_available_gb, "GB");
-        eprintln!("Thermals:");
-        print_f32_row("  CPU Gold", &self.temp_gold, "°C");
-        print_f32_row("  CPU Silver", &self.temp_silver, "°C");
-        print_f32_row("  GPU Adreno", &self.temp_gpu, "°C");
-        print_f32_row("  NPU Hexagon", &self.temp_npu, "°C");
-        print_f32_row("  RAM LPDDR5", &self.temp_ram, "°C");
+        let print_u32_row = |out: &mut String, name: &str, data: &[u32], unit: &str| {
+            if let Some(st) = calc_u32_stats(data.to_vec()) {
+                let label = if unit.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{} ({})", name, unit)
+                };
+                let _ = writeln!(
+                    out,
+                    "{:<28} {:>10} {:>10} {:>10} {:>10}",
+                    label, st.min, st.median, st.p90, st.max
+                );
+            }
+        };
+
+        print_f64_row(&mut out, "Board Power", &self.power_watts, "W");
+        print_u32_row(&mut out, "Fan Speed", &self.fan_rpms, "RPM");
+        print_f32_row(&mut out, "CPU Total Load", &self.cpu_total, "%");
+        print_f32_row(&mut out, "  Big Cluster (A78C)", &self.cpu_big, "%");
+        print_f32_row(&mut out, "  Little Cluster (A55)", &self.cpu_little, "%");
+        print_f64_row(&mut out, "RAM Available", &self.ram_available_gb, "GB");
+        let _ = writeln!(out, "Thermals:");
+        print_f32_row(&mut out, "  CPU Gold", &self.temp_gold, "°C");
+        print_f32_row(&mut out, "  CPU Silver", &self.temp_silver, "°C");
+        print_f32_row(&mut out, "  GPU Adreno", &self.temp_gpu, "°C");
+        print_f32_row(&mut out, "  NPU Hexagon", &self.temp_npu, "°C");
+        print_f32_row(&mut out, "  RAM LPDDR5", &self.temp_ram, "°C");
 
         if !self.markers.is_empty() {
-            eprintln!();
-            eprintln!("MARKER PHASES & INTERVAL PROFILING:");
-            eprintln!(
+            let _ = writeln!(out);
+            let _ = writeln!(out, "MARKER PHASES & INTERVAL PROFILING:");
+            let _ = writeln!(
+                out,
                 "────────────────────────────────────────────────────────────────────────────────"
             );
 
@@ -329,11 +379,12 @@ impl SummaryTracker {
                     .map(|p| format!("{:.2} W", p))
                     .unwrap_or_else(|| "N/A".to_string());
 
-                eprintln!(
+                let _ = writeln!(
+                    out,
                     "  \"{}\" → \"{}\" ({:.1}s, {} samples):",
                     m_curr.label, next_label, window_duration, slice_len
                 );
-                eprintln!("    Overall : Power: median {} | NPU Active: {:5.1}% | CPU: Big {:4.1}%, Little {:4.1}%",
+                let _ = writeln!(out, "    Overall : Power: median {} | NPU Active: {:5.1}% | CPU: Big {:4.1}%, Little {:4.1}%",
                           power_str, npu_pct, med_big, med_little);
 
                 // Partition slice into Prompt, Decode, and Idle sub-phases
@@ -508,14 +559,20 @@ impl SummaryTracker {
                     } else {
                         "    ├─ "
                     };
-                    eprintln!("{}{}", prefix, line);
+                    let _ = writeln!(out, "{}{}", prefix, line);
                 }
             }
         }
 
-        eprintln!(
+        let _ = writeln!(
+            out,
             "================================================================================"
         );
+        out
+    }
+
+    pub fn print_report(&self, active_threshold_pct: f32, elapsed_secs: f64) {
+        eprint!("{}", self.format_report(active_threshold_pct, elapsed_secs));
     }
 }
 
@@ -539,6 +596,90 @@ mod tests {
         assert_eq!(stats.max, 50.0);
         assert_eq!(stats.median, 10.0);
         assert_eq!(stats.p90, 50.0);
+    }
+
+    #[test]
+    fn test_calc_u32_stats() {
+        assert!(calc_u32_stats(vec![]).is_none());
+
+        let single = calc_u32_stats(vec![2818]).unwrap();
+        assert_eq!(single.min, 2818);
+        assert_eq!(single.median, 2818);
+        assert_eq!(single.p90, 2818);
+        assert_eq!(single.max, 2818);
+
+        let multi = calc_u32_stats(vec![3300, 2818, 3250, 3000, 3150, 2900, 3200, 3100, 3220, 3150])
+            .unwrap();
+        // sorted (10 elements): [2818, 2900, 3000, 3100, 3150, 3150, 3200, 3220, 3250, 3300]
+        // n = 10 -> median = idx 5 (3150), p90 = idx 9 (3300)
+        assert_eq!(multi.min, 2818);
+        assert_eq!(multi.median, 3150);
+        assert_eq!(multi.p90, 3300);
+        assert_eq!(multi.max, 3300);
+    }
+
+    #[test]
+    fn test_summary_tracker_fan_speed_report_and_omission() {
+        let sys = System::new();
+
+        // 1. Tracker with fan_rpm populated across samples (and one None sample)
+        let mut tracker = SummaryTracker::default();
+        let rpms = [
+            Some(3250),
+            Some(2818),
+            None,
+            Some(3150),
+            Some(3300),
+            Some(2950),
+            Some(3100),
+            Some(3150),
+            Some(3200),
+            Some(3050),
+            Some(3250),
+        ];
+        // 10 valid RPMs sorted: [2818, 2950, 3050, 3100, 3150, 3150, 3200, 3250, 3250, 3300]
+        // min = 2818, median (idx 5) = 3150, p90 (idx 9) = 3300, max = 3300
+        for rpm in rpms {
+            let mut s = collect_snapshot_continuous(&sys, &[], false);
+            s.power_fan.board_power_watts = Some(14.50);
+            s.power_fan.fan_rpm = rpm;
+            tracker.record_sample(&s, 50.0);
+        }
+
+        assert_eq!(tracker.fan_rpms.len(), 10);
+        let report = tracker.format_report(50.0, 2.2);
+        let expected_fan_row = format!(
+            "{:<28} {:>10} {:>10} {:>10} {:>10}",
+            "Fan Speed (RPM)", 2818, 3150, 3300, 3300
+        );
+        assert!(
+            report.contains(&expected_fan_row),
+            "Expected report to contain exact Fan Speed row:\n{}\nActual report:\n{}",
+            expected_fan_row,
+            report
+        );
+
+        // Verify Fan Speed (RPM) appears immediately after Board Power (W)
+        let power_pos = report.find("Board Power (W)").expect("Board Power row missing");
+        let fan_pos = report.find("Fan Speed (RPM)").expect("Fan Speed row missing");
+        let cpu_pos = report.find("CPU Total Load (%)").expect("CPU Total Load row missing");
+        assert!(power_pos < fan_pos && fan_pos < cpu_pos);
+
+        // 2. Tracker where all samples have fan_rpm: None -> Fan Speed (RPM) row must be omitted
+        let mut tracker_no_fan = SummaryTracker::default();
+        for _ in 0..3 {
+            let mut s = collect_snapshot_continuous(&sys, &[], false);
+            s.power_fan.board_power_watts = Some(12.00);
+            s.power_fan.fan_rpm = None;
+            tracker_no_fan.record_sample(&s, 50.0);
+        }
+        assert!(tracker_no_fan.fan_rpms.is_empty());
+        let report_no_fan = tracker_no_fan.format_report(50.0, 0.6);
+        assert!(
+            !report_no_fan.contains("Fan Speed (RPM)"),
+            "Expected Fan Speed (RPM) row to be omitted when fan_rpms is empty, got:\n{}",
+            report_no_fan
+        );
     }
 
     #[test]
