@@ -53,11 +53,7 @@ struct HwmonDeviceReadings {
 }
 
 /// Scan a single `hwmon*` device directory in one pass for fan and/or power channels.
-fn scan_hwmon_device_dir(
-    path: &Path,
-    scan_fan: bool,
-    scan_power: bool,
-) -> HwmonDeviceReadings {
+fn scan_hwmon_device_dir(path: &Path, scan_fan: bool, scan_power: bool) -> HwmonDeviceReadings {
     let mut readings = HwmonDeviceReadings::default();
     if !scan_fan && !scan_power {
         return readings;
@@ -91,8 +87,7 @@ fn scan_hwmon_device_dir(
             } else if scan_power {
                 if matches!(parse_hwmon_channel(prefix, "power"), Some(ch) if ch >= 1) {
                     if let Some(uw) = read_cached_u32(&entry.path().to_string_lossy()) {
-                        readings.power_uw =
-                            Some(readings.power_uw.map_or(uw, |prev| prev.max(uw)));
+                        readings.power_uw = Some(readings.power_uw.map_or(uw, |prev| prev.max(uw)));
                     }
                 } else if let Some(ch) = parse_hwmon_channel(prefix, "in") {
                     if let Some(mv) = read_cached_u32(&entry.path().to_string_lossy()) {
@@ -328,8 +323,11 @@ mod tests {
         for active_ch in 1..=5 {
             for ch in 1..=5 {
                 let rpm = if ch == active_ch { 2818 } else { 0 };
-                std::fs::write(hwmon0.join(format!("fan{}_input", ch)), format!("{}\n", rpm))
-                    .unwrap();
+                std::fs::write(
+                    hwmon0.join(format!("fan{}_input", ch)),
+                    format!("{}\n", rpm),
+                )
+                .unwrap();
                 std::fs::write(hwmon0.join(format!("fan{}_fault", ch)), "0\n").unwrap();
             }
             crate::file_cache::reset_file_cache();
@@ -533,11 +531,7 @@ mod tests {
             "some_custom_asic\n",
         )
         .unwrap();
-        std::fs::write(
-            temp_dir.join("sys/class/hwmon/hwmon0/fan1_input"),
-            "1800\n",
-        )
-        .unwrap();
+        std::fs::write(temp_dir.join("sys/class/hwmon/hwmon0/fan1_input"), "1800\n").unwrap();
         crate::file_cache::reset_file_cache();
 
         let pf_fallback = get_hardware_power_fan();

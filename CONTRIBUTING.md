@@ -101,7 +101,7 @@ Telemetry should preserve the architectural distinction between:
 
 When creating release distributions for the compiled binary, Clause 2 of the BSD 3-Clause License requires bundling the license notices:
 ```bash
-tar -czvf ventop-ai-v0.3.8-aarch64-unknown-linux-gnu.tar.gz \
+tar -czvf ventop-ai-v0.3.9-aarch64-unknown-linux-gnu.tar.gz \
   -C target/aarch64-unknown-linux-gnu/release ventop-ai \
   -C ../../../ LICENSE ATTRIBUTION.md
 ```

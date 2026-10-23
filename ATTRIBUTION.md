@@ -127,7 +127,7 @@ To satisfy this legal requirement when distributing precompiled binaries (`vento
 ### Release Packaging Command
 ```bash
 # Example packaging for aarch64 release from repository root:
-tar -czvf ventop-ai-v0.3.8-aarch64-unknown-linux-gnu.tar.gz \
+tar -czvf ventop-ai-v0.3.9-aarch64-unknown-linux-gnu.tar.gz \
   LICENSE ATTRIBUTION.md \
   -C target/aarch64-unknown-linux-gnu/release ventop-ai
 ```

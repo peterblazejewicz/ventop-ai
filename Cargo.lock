@@ -684,7 +684,7 @@ checksum = "7dd6e30e90baa6f72411720665d41d89b9a3d039dc45b8faea1ddd07f617f6af"
 
 [[package]]
 name = "ventop-ai"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "anyhow",
  "crossterm",

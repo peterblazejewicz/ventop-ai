@@ -608,8 +608,10 @@ mod tests {
         assert_eq!(single.p90, 2818);
         assert_eq!(single.max, 2818);
 
-        let multi = calc_u32_stats(vec![3300, 2818, 3250, 3000, 3150, 2900, 3200, 3100, 3220, 3150])
-            .unwrap();
+        let multi = calc_u32_stats(vec![
+            3300, 2818, 3250, 3000, 3150, 2900, 3200, 3100, 3220, 3150,
+        ])
+        .unwrap();
         // sorted (10 elements): [2818, 2900, 3000, 3100, 3150, 3150, 3200, 3220, 3250, 3300]
         // n = 10 -> median = idx 5 (3150), p90 = idx 9 (3300)
         assert_eq!(multi.min, 2818);
@@ -660,9 +662,15 @@ mod tests {
         );
 
         // Verify Fan Speed (RPM) appears immediately after Board Power (W)
-        let power_pos = report.find("Board Power (W)").expect("Board Power row missing");
-        let fan_pos = report.find("Fan Speed (RPM)").expect("Fan Speed row missing");
-        let cpu_pos = report.find("CPU Total Load (%)").expect("CPU Total Load row missing");
+        let power_pos = report
+            .find("Board Power (W)")
+            .expect("Board Power row missing");
+        let fan_pos = report
+            .find("Fan Speed (RPM)")
+            .expect("Fan Speed row missing");
+        let cpu_pos = report
+            .find("CPU Total Load (%)")
+            .expect("CPU Total Load row missing");
         assert!(power_pos < fan_pos && fan_pos < cpu_pos);
 
         // 2. Tracker where all samples have fan_rpm: None -> Fan Speed (RPM) row must be omitted
